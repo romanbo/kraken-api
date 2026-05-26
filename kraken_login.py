@@ -9,7 +9,9 @@
 # Example: ./krakenapi.py TradeBalance asset=xdg
 # Example: ./krakenapi.py OpenPositions
 # Example: ./krakenapi.py AddOrder pair=xxbtzusd type=buy ordertype=market volume=0.003 leverage=5
+# Example: ./krakenapi.py Ticker pair=BTC/USD,ETH/USD
 # Example: ./krakenapi.py Ticker pair=BTC/USD,ETH/USD --stream
+# Example: ./krakenapi.py Ticker pair=BTC/USD,ETH/USD --stream -pretty
 
 import sys
 import time
@@ -63,6 +65,52 @@ def parse_params(data_str):
             k, v = item.split('=', 1)
             params[k] = v
     return params
+
+
+# --- Ticker formatting ---
+
+def format_ticker_rest(result):
+    """Print a formatted table from a REST /0/public/Ticker response result dict."""
+    col_w = 14
+    header = f"{'Pair':<12} {'Last':>{col_w}} {'Bid':>{col_w}} {'Ask':>{col_w}} {'24h Low':>{col_w}} {'24h High':>{col_w}} {'24h Vol':>{col_w}} {'24h VWAP':>{col_w}}"
+    print(header)
+    print('-' * len(header))
+    for pair, d in result.items():
+        last   = d['c'][0]
+        bid    = d['b'][0]
+        ask    = d['a'][0]
+        low    = d['l'][1]
+        high   = d['h'][1]
+        vol    = d['v'][1]
+        vwap   = d['p'][1]
+        print(f"{pair:<12} {float(last):>{col_w},.2f} {float(bid):>{col_w},.2f} {float(ask):>{col_w},.2f} "
+              f"{float(low):>{col_w},.2f} {float(high):>{col_w},.2f} {float(vol):>{col_w},.4f} {float(vwap):>{col_w},.2f}")
+
+
+def format_ticker_ws(msg_str):
+    """Pretty-print a WebSocket v2 ticker message; returns True if it was a ticker message."""
+    try:
+        msg = json.loads(msg_str)
+    except ValueError:
+        return False
+    if not isinstance(msg, dict) or msg.get('channel') != 'ticker':
+        return False
+    msg_type = msg.get('type', '')
+    for d in msg.get('data', []):
+        symbol  = d.get('symbol', '?')
+        last    = d.get('last', 0)
+        bid     = d.get('bid', 0)
+        ask     = d.get('ask', 0)
+        low     = d.get('low', 0)
+        high    = d.get('high', 0)
+        vol     = d.get('volume', 0)
+        chg_pct = d.get('change_pct', 0)
+        sign    = '+' if chg_pct >= 0 else ''
+        ts      = time.strftime('%H:%M:%S')
+        print(f"[{ts}] {symbol:<10} last={last:>12,.2f}  bid={bid:>12,.2f}  ask={ask:>12,.2f}"
+              f"  lo={low:>12,.2f}  hi={high:>12,.2f}  vol={vol:>12,.4f}  chg={sign}{chg_pct:.2f}%",
+              flush=True)
+    return True
 
 
 # --- Minimal stdlib WebSocket client ---
@@ -160,7 +208,11 @@ def stream_quotes(symbols, pretty=False):
         if msg is None:
             break
         if pretty:
-            print(json.dumps(json.loads(msg), indent=4), flush=True)
+            if not format_ticker_ws(msg):
+                parsed_msg = json.loads(msg)
+                if parsed_msg.get('channel') == 'heartbeat':
+                    continue
+                print(json.dumps(parsed_msg, indent=4), flush=True)
         else:
             print(msg, flush=True)
 
@@ -222,9 +274,14 @@ except Exception as error:
     print("API response invalid (%s)" % error)
     sys.exit(1)
 
-if '"error":[]' in api_reply:
-    print(api_reply if output_format == 0 else json.dumps(json.loads(api_reply), indent=4))
-    sys.exit(0)
+parsed = json.loads(api_reply)
+has_error = bool(parsed.get('error'))
+
+if api_method == 'Ticker' and not has_error and output_format == 1:
+    format_ticker_rest(parsed['result'])
+elif output_format == 1:
+    print(json.dumps(parsed, indent=4))
 else:
-    print(api_reply if output_format == 0 else json.dumps(json.loads(api_reply), indent=4))
-    sys.exit(1)
+    print(api_reply)
+
+sys.exit(1 if has_error else 0)
