@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
-# Kraken Rest API + WebSocket streaming
+# Kraken Rest API + WebSocket streaming + historical data download
 #
-# Usage: ./krakenapi.py endpoint [parameters] [-pretty] [--stream]
+# Usage: ./krakenapi.py endpoint [parameters] [-pretty] [--stream] [--history]
 # Example: ./krakenapi.py Time
 # Example: ./krakenapi.py OHLC pair=xbtusd interval=1440
 # Example: ./krakenapi.py Balance
@@ -12,6 +12,10 @@
 # Example: ./krakenapi.py Ticker pair=BTC/USD,ETH/USD
 # Example: ./krakenapi.py Ticker pair=BTC/USD,ETH/USD --stream
 # Example: ./krakenapi.py Ticker pair=BTC/USD,ETH/USD --stream -pretty
+# Example: ./krakenapi.py OHLC pair=xbtusd interval=1440 --history
+# Example: ./krakenapi.py OHLC pair=xbtusd interval=60 since=2024-01-01 --history > ohlc.csv
+# Example: ./krakenapi.py Trades pair=xbtusd --history
+# Example: ./krakenapi.py Trades pair=xbtusd since=2024-01-01 --history > trades.csv
 
 import sys
 import time
@@ -24,6 +28,7 @@ import socket
 import ssl
 import struct
 import os
+import datetime
 
 api_public = {"Time", "Assets", "AssetPairs", "Ticker", "OHLC", "Depth", "Trades", "Spread", "SystemStatus"}
 api_private = {"Balance", "BalanceEx", "TradeBalance", "OpenOrders", "ClosedOrders", "QueryOrders", "TradesHistory", "QueryTrades", "OpenPositions", "Ledgers", "QueryLedgers", "TradeVolume", "AddExport", "ExportStatus", "RetrieveExport", "RemoveExport", "GetWebSocketsToken", "CreateSubaccount", "AccountTransfer"}
@@ -38,6 +43,7 @@ WS_PATH = "/v2"
 api_data = ""
 output_format = 0
 stream_mode = False
+history_mode = False
 
 if len(sys.argv) < 2:
     api_method = "Time"
@@ -52,6 +58,9 @@ else:
         if sys.argv[count] == '--stream':
             stream_mode = True
             continue
+        if sys.argv[count] == '--history':
+            history_mode = True
+            continue
         if count == 2:
             api_data = sys.argv[count]
         else:
@@ -65,6 +74,93 @@ def parse_params(data_str):
             k, v = item.split('=', 1)
             params[k] = v
     return params
+
+
+def parse_since(s):
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    for fmt in ('%Y-%m-%d', '%Y-%m-%dT%H:%M:%S', '%Y/%m/%d'):
+        try:
+            return int(datetime.datetime.strptime(s, fmt).timestamp())
+        except ValueError:
+            continue
+    print(f"Cannot parse date '{s}' — use YYYY-MM-DD or a Unix timestamp", file=sys.stderr)
+    sys.exit(1)
+
+
+def _public_get(endpoint, params):
+    qs = '&'.join(f"{k}={v}" for k, v in params.items())
+    req = urllib.request.Request(f"{api_domain}/0/public/{endpoint}?{qs}")
+    req.add_header("User-Agent", "Kraken REST API")
+    return json.loads(urllib.request.urlopen(req).read().decode())
+
+
+# --- Historical data download ---
+
+def download_ohlc_history(pair, interval=1440, since=None):
+    print("time,open,high,low,close,vwap,volume,count")
+    total = 0
+    while True:
+        params = {'pair': pair, 'interval': str(interval)}
+        if since is not None:
+            params['since'] = str(since)
+        try:
+            data = _public_get('OHLC', params)
+        except Exception as e:
+            print(f"\nRequest failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        if data.get('error'):
+            print(f"\nAPI error: {data['error']}", file=sys.stderr)
+            sys.exit(1)
+        result = data['result']
+        last = result.get('last')
+        candles = next((v for k, v in result.items() if k != 'last'), [])
+        if not candles:
+            break
+        for c in candles:
+            print(','.join(str(x) for x in c))
+        total += len(candles)
+        print(f"  {total} candles...", file=sys.stderr, end='\r')
+        if last is None or last == since:
+            break
+        since = last
+        time.sleep(0.5)
+    print(f"\nDone. {total} candles total.", file=sys.stderr)
+
+
+def download_trades_history(pair, since=None):
+    print("price,volume,time,side,type,misc,trade_id")
+    total = 0
+    # Trades endpoint uses nanosecond timestamps; convert user-provided seconds
+    since_ns = str(since * 1_000_000_000) if since is not None else None
+    while True:
+        params = {'pair': pair}
+        if since_ns is not None:
+            params['since'] = since_ns
+        try:
+            data = _public_get('Trades', params)
+        except Exception as e:
+            print(f"\nRequest failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        if data.get('error'):
+            print(f"\nAPI error: {data['error']}", file=sys.stderr)
+            sys.exit(1)
+        result = data['result']
+        last = result.get('last')
+        trades = next((v for k, v in result.items() if k != 'last'), [])
+        if not trades:
+            break
+        for t in trades:
+            print(','.join(str(x) for x in t))
+        total += len(trades)
+        print(f"  {total} trades...", file=sys.stderr, end='\r')
+        if last is None or last == since_ns:
+            break
+        since_ns = last
+        time.sleep(0.5)
+    print(f"\nDone. {total} trades total.", file=sys.stderr)
 
 
 # --- Ticker formatting ---
@@ -235,6 +331,30 @@ if stream_mode:
         print("--stream requires pair=SYMBOL[,SYMBOL] (e.g. pair=BTC/USD,ETH/USD)")
         sys.exit(1)
     stream_quotes(symbols, output_format == 1)
+    sys.exit(0)
+
+
+# --- Historical download ---
+
+if history_mode:
+    params = parse_params(api_data)
+    pair = params.get('pair', '')
+    if not pair:
+        print("--history requires pair=SYMBOL (e.g. pair=XBTUSD)", file=sys.stderr)
+        sys.exit(1)
+    since_raw = params.get('since')
+    since = parse_since(since_raw) if since_raw else None
+    try:
+        if api_method == 'OHLC':
+            interval = int(params.get('interval', 1440))
+            download_ohlc_history(pair, interval, since)
+        elif api_method == 'Trades':
+            download_trades_history(pair, since)
+        else:
+            print(f"--history is only supported for OHLC and Trades endpoints", file=sys.stderr)
+            sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
     sys.exit(0)
 
 
