@@ -198,23 +198,33 @@ def ws_recv(sock):
 # --- Streaming quotes ---
 
 def stream_quotes(symbols, pretty=False):
-    sock = ws_connect(WS_HOST, WS_PATH)
-    ws_send(sock, json.dumps({
-        "method": "subscribe",
-        "params": {"channel": "ticker", "symbol": symbols},
-    }))
+    print(f"Streaming {', '.join(symbols)} — press Ctrl+C to stop", flush=True)
     while True:
-        msg = ws_recv(sock)
-        if msg is None:
-            break
-        if pretty:
-            if not format_ticker_ws(msg):
-                parsed_msg = json.loads(msg)
-                if parsed_msg.get('channel') == 'heartbeat':
-                    continue
-                print(json.dumps(parsed_msg, indent=4), flush=True)
-        else:
-            print(msg, flush=True)
+        try:
+            sock = ws_connect(WS_HOST, WS_PATH)
+            ws_send(sock, json.dumps({
+                "method": "subscribe",
+                "params": {"channel": "ticker", "symbol": symbols},
+            }))
+            while True:
+                msg = ws_recv(sock)
+                if msg is None:
+                    print("Connection closed by server, reconnecting...", flush=True)
+                    break
+                if pretty:
+                    if not format_ticker_ws(msg):
+                        parsed_msg = json.loads(msg)
+                        if parsed_msg.get('channel') == 'heartbeat':
+                            continue
+                        print(json.dumps(parsed_msg, indent=4), flush=True)
+                else:
+                    print(msg, flush=True)
+        except KeyboardInterrupt:
+            print("\nStopped.", flush=True)
+            return
+        except (ConnectionError, OSError) as e:
+            print(f"Connection error ({e}), reconnecting in 5s...", flush=True)
+            time.sleep(5)
 
 
 if stream_mode:
@@ -224,10 +234,7 @@ if stream_mode:
     if not symbols:
         print("--stream requires pair=SYMBOL[,SYMBOL] (e.g. pair=BTC/USD,ETH/USD)")
         sys.exit(1)
-    try:
-        stream_quotes(symbols, output_format == 1)
-    except KeyboardInterrupt:
-        pass
+    stream_quotes(symbols, output_format == 1)
     sys.exit(0)
 
 
